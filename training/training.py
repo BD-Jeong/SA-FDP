@@ -13,61 +13,106 @@ DEFAULT_INTERVAL = 60  # Default window interval in seconds
 CHUNK_SIZE = 1024 * 1024  # Chunk size: 1MB (1048576 bytes)
 TRACE_PIPE = "/sys/kernel/debug/tracing/trace_pipe"
 
-def get_device_size(device_path):
+def namespace_block_path(controller_path, nsid):
+    """Build /dev/nvme0n1 from /dev/nvme0 and NSID."""
+    m = re.match(r"^/dev/(nvme\d+)$", controller_path)
+    if not m:
+        raise ValueError(
+            f"device must be NVMe controller path (e.g. /dev/nvme0), got: {controller_path!r}"
+        )
+    return f"/dev/{m.group(1)}n{int(nsid)}"
+
+
+def get_namespace_size_bytes(controller_path, nsid):
     """
-    Get total controller size in bytes using nvme id-ctrl command
-    Reads tnvmcap (Total NVM Capacity) from controller
-    
+    Namespace size in bytes via blockdev on /dev/nvme{c}n{nsid}.
+
     Args:
-        device_path: Path to controller device (e.g., /dev/nvme0)
-        
+        controller_path: e.g. /dev/nvme0
+        nsid: Namespace ID (1, 2, ...)
+
     Returns:
-        int: Total controller size in bytes (tnvmcap value)
+        int: Size of that namespace in bytes
     """
+    ns_path = namespace_block_path(controller_path, nsid)
     try:
-        # Run nvme id-ctrl command to get tnvmcap
         result = subprocess.run(
-            ["sudo", "nvme", "id-ctrl", device_path],
+            ["sudo", "blockdev", "--getsize64", ns_path],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
-        # Parse tnvmcap from output (case-insensitive)
-        # Output is always in decimal format
-        for line in result.stdout.split('\n'):
-            if 'tnvmcap' in line.lower():
-                # Extract the value (format: "tnvmcap : 1234567890")
-                parts = line.split(':')
-                if len(parts) >= 2:
-                    # Remove whitespace and parse as decimal integer
-                    value_str = parts[1].strip()
-                    total_size = int(value_str)
-                    return total_size
-        raise RuntimeError(f"tnvmcap not found in nvme id-ctrl output")
-    except (subprocess.CalledProcessError, ValueError, IOError) as e:
-        raise RuntimeError(f"Failed to get device size: {e}")
+        return int(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError, OSError) as e:
+        raise RuntimeError(
+            f"Failed to get namespace size for {ns_path} (controller={controller_path}, ns={nsid}): {e}"
+        ) from e
+
+
+def get_logical_block_size_bytes(ns_path):
+    """Logical sector size in bytes (512 or 4096 typical) via blockdev --getss."""
+    try:
+        result = subprocess.run(
+            ["sudo", "blockdev", "--getss", ns_path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return int(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError, OSError) as e:
+        raise RuntimeError(f"Failed to get logical block size for {ns_path}: {e}") from e
+
+
+def lba_shift_and_lbas_per_chunk(logical_b):
+    """Match kernel: slba from sector, chunk index from 1MB-aligned logical extents."""
+    if logical_b == 512:
+        return 9, CHUNK_SIZE // 512
+    if logical_b == 4096:
+        return 12, CHUNK_SIZE // 4096
+    raise ValueError(
+        f"Unsupported logical block size {logical_b} (expected 512 or 4096)"
+    )
+
 
 # --- Load eBPF C code from file ---
-def load_bpf_code(max_chunks):
+def load_bpf_code(max_chunks, ns_path, lba_shift, lbas_per_chunk):
     """
-    Load eBPF C code from file and inject max chunks
-    
+    Load eBPF C code from file and inject max_chunks, ns_path, and bd major/minor.
+
+    ns_path is passed as a C string macro; the program matches I/O to that namespace
+    via stat(ns_path).st_rdev (injected as __TRACK_BD_MAJOR__ / __TRACK_BD_MINOR__).
+
     Args:
-        max_chunks: Maximum number of chunks to inject
-        
+        max_chunks: Maximum number of chunks (array size and chunk index bound).
+        ns_path: Block device path (e.g. /dev/nvme0n1).
+        lba_shift: 9 for 512B LBA, 12 for 4K LBA.
+        lbas_per_chunk: LBAs per 1MB chunk (2048 or 256).
+
     Returns:
         str: eBPF C code with parameters injected
     """
-    # Get the directory where this script is located
     script_dir = Path(__file__).parent
     bpf_file = script_dir / "training.bpf.c"
     with open(bpf_file, "r") as f:
         bpf_text = f.read()
+    st = os.stat(ns_path)
+    bd_major = os.major(st.st_rdev)
+    bd_minor = os.minor(st.st_rdev)
+    c_path = ns_path.replace("\\", "\\\\").replace('"', '\\"')
     # Inject max chunks as compile-time constant (verifier rejects global variable read)
     bpf_text = bpf_text.replace("#define __MAX_CHUNKS__ 0", f"#define __MAX_CHUNKS__ {max_chunks}")
+    bpf_text = bpf_text.replace("#define __TRACKED_NS_PATH__ \"\"", f'#define __TRACKED_NS_PATH__ "{c_path}"')
+    bpf_text = bpf_text.replace("#define __TRACK_BD_MAJOR__ 0", f"#define __TRACK_BD_MAJOR__ {bd_major}")
+    bpf_text = bpf_text.replace("#define __TRACK_BD_MINOR__ 0", f"#define __TRACK_BD_MINOR__ {bd_minor}")
+    bpf_text = bpf_text.replace("#define __LBA_SHIFT__ 0", f"#define __LBA_SHIFT__ {lba_shift}")
+    bpf_text = bpf_text.replace(
+        "#define __LBAS_PER_CHUNK__ 0", f"#define __LBAS_PER_CHUNK__ {lbas_per_chunk}"
+    )
     # Inject max chunks for BPF_ARRAY size (dynamically set based on device size)
-    bpf_text = bpf_text.replace("BPF_ARRAY(chunk_array, struct chunk_info, 1);",
-                                f"BPF_ARRAY(chunk_array, struct chunk_info, {max_chunks});")
+    bpf_text = bpf_text.replace(
+        "BPF_ARRAY(chunk_array, struct chunk_info, 1);",
+        f"BPF_ARRAY(chunk_array, struct chunk_info, {max_chunks});",
+    )
     return bpf_text
 
 def trace_pipe_reader(stop_event):
@@ -86,22 +131,28 @@ def trace_pipe_reader(stop_event):
 # --- User space (control plane) ---
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", required=True, help="Target NVMe controller device (e.g., /dev/nvme0)")
+    parser.add_argument("--dev", required=True, help="NVMe controller character device (e.g. /dev/nvme0)")
+    parser.add_argument("--ns", type=int, required=True, metavar="NSID", help="Namespace ID (e.g. 1 for nvme0n1)")
     parser.add_argument("--output", required=True, help="Output CSV file path")
     args = parser.parse_args()
 
-    # Get device size and calculate max chunks
-    # Note: max_chunks will be injected into eBPF code as the BPF_ARRAY size
-    device_size = get_device_size(args.device)
+    ns_path = namespace_block_path(args.dev, args.ns)
+    device_size = get_namespace_size_bytes(args.dev, args.ns)
+    logical_b = get_logical_block_size_bytes(ns_path)
+    lba_shift, lbas_per_chunk = lba_shift_and_lbas_per_chunk(logical_b)
     max_chunks = device_size // CHUNK_SIZE
-    print(f"Tracking {args.device} (all namespaces) every {DEFAULT_INTERVAL}s")
+    print(
+        f"Tracking {ns_path} (controller {args.dev}, NS {args.ns}) every {DEFAULT_INTERVAL}s"
+    )
     print(f"Device size: {device_size / (1024**3):.2f} GB")
+    print(
+        f"Logical block: {logical_b} B → lba_shift={lba_shift}, LBAs/chunk={lbas_per_chunk}"
+    )
     print(f"Max chunks: {max_chunks:,} (BPF_ARRAY size will be set to {max_chunks:,})")
     print(f"Saving to {args.output}\n")
 
-    # Load eBPF code from file and inject max chunks
-    bpf_code = load_bpf_code(max_chunks)
-    b = BPF(text=bpf_code)
+    bpf_code = load_bpf_code(max_chunks, ns_path, lba_shift, lbas_per_chunk)
+    b = BPF(text=bpf_code, cflags=["-Wno-duplicate-decl-specifier"])
     chunk_array = b.get_table("chunk_array")
 
     # kretprobe__nvme_setup_cmd is auto-attached by BCC
@@ -112,13 +163,17 @@ def main():
     trace_thread.start()
     print("BPF trace_pipe reader started (bpf_trace_printk will appear as [trace] ...)\n")
 
-    # CSV header: cidx, sv_t2e, sv_ev_ind, upd_cnt, last_int (monotonic time)
-    with open(args.output, "w") as f:
-        f.write("cidx,sv_t2e,sv_ev_ind,upd_cnt,last_int\n")
+    out_path = Path(args.output)
+    out_dir = out_path.parent if str(out_path.parent) != "" else Path(".")
+    stem = out_path.stem
+    suffix = out_path.suffix or ".csv"
+    header = "cidx,sv_t2e,sv_ev_ind,upd_cnt,last_int\n"
+    window_idx = 0
 
     snapshot_buffer = [None] * max_chunks  # Snapshot buffer
     try:
         while True:
+            window_idx += 1
             window_start = time.monotonic()
             time.sleep(DEFAULT_INTERVAL)
             window_end = time.monotonic()
@@ -143,15 +198,17 @@ def main():
                 v.last_accessed_lba = 0xFFFFFFFFFFFFFFFF  # unset for next window
 
             # 3) Write snapshot buffer to file (monotonic time operations)
-            with open(args.output, "a") as f:
+            window_out = out_dir / f"{stem}_{window_idx}{suffix}"
+            with open(window_out, "w") as f:
+                f.write(header)
                 for chunk_id in range(max_chunks):
                     t2e_ts, luts, uc, ev = snapshot_buffer[chunk_id]
                     if uc > 0:
                         sv_t2e = max(0.0, t2e_ts - window_start) # time to event from window start
                         last_int = max(0.0, window_end - luts) # latest update interval 
-                        f.write(f"{chunk_id},{sv_t2e},{ev},{uc},{last_int}\n")
+                        f.write(f"{chunk_id},{sv_t2e:.3f},{ev},{uc},{last_int:.3f}\n")
 
-            print(f"[{window_end:.1f}] Dumped window data and cleared map.")
+            print(f"[{window_end:.1f}] Wrote {window_out} and cleared map.")
 
     except KeyboardInterrupt:
         print("\nTracing stopped.")

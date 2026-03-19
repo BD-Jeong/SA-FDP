@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 # Global constants
-DEFAULT_INTERVAL = 5.0  # Default logging interval in seconds
+DEFAULT_INTERVAL = 10.0  # Default logging interval in seconds
 DEFAULT_WAF_INTERVAL = 60.0  # Default WAF calculation interval in seconds
 
 # Power log constants
