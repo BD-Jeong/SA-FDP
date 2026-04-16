@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
+import math
 import re
 import subprocess
 import time
@@ -12,6 +14,17 @@ from bcc import BPF
 DEFAULT_INTERVAL = 60  # Default window interval in seconds
 CHUNK_SIZE = 1024 * 1024  # Chunk size: 1MB (1048576 bytes)
 TRACE_PIPE = "/sys/kernel/debug/tracing/trace_pipe"
+# BPF __SV_EVENT_AT_UPDATE__: this → set sv_t2e_ms / indicator.
+SV_EVENT_AT_UPDATE = 10
+
+class WindowTimes(ctypes.Structure):
+    """Must match struct window_times in training.bpf.c (monotonic ms, u64)."""
+
+    _fields_ = [
+        ("window_start_ms", ctypes.c_uint64),
+        ("window_end_ms", ctypes.c_uint64),
+    ]
+
 
 def namespace_block_path(controller_path, nsid):
     """Build /dev/nvme0n1 from /dev/nvme0 and NSID."""
@@ -108,6 +121,10 @@ def load_bpf_code(max_chunks, ns_path, lba_shift, lbas_per_chunk):
     bpf_text = bpf_text.replace(
         "#define __LBAS_PER_CHUNK__ 0", f"#define __LBAS_PER_CHUNK__ {lbas_per_chunk}"
     )
+    bpf_text = bpf_text.replace(
+        "#define __SV_EVENT_AT_UPDATE__ 1",
+        f"#define __SV_EVENT_AT_UPDATE__ {SV_EVENT_AT_UPDATE}",
+    )
     # Inject max chunks for BPF_ARRAY size (dynamically set based on device size)
     bpf_text = bpf_text.replace(
         "BPF_ARRAY(chunk_array, struct chunk_info, 1);",
@@ -149,11 +166,15 @@ def main():
         f"Logical block: {logical_b} B → lba_shift={lba_shift}, LBAs/chunk={lbas_per_chunk}"
     )
     print(f"Max chunks: {max_chunks:,} (BPF_ARRAY size will be set to {max_chunks:,})")
+    print(f"SV event at update (BPF __SV_EVENT_AT_UPDATE__): {SV_EVENT_AT_UPDATE}")
     print(f"Saving to {args.output}\n")
 
     bpf_code = load_bpf_code(max_chunks, ns_path, lba_shift, lbas_per_chunk)
     b = BPF(text=bpf_code, cflags=["-Wno-duplicate-decl-specifier"])
     chunk_array = b.get_table("chunk_array")
+    window_cfg = b.get_table("window_cfg")
+    wkey = ctypes.c_int(0)
+    interval_ms = DEFAULT_INTERVAL * 1000
 
     # kretprobe__nvme_setup_cmd is auto-attached by BCC
 
@@ -165,50 +186,61 @@ def main():
 
     out_path = Path(args.output)
     out_dir = out_path.parent if str(out_path.parent) != "" else Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
     stem = out_path.stem
     suffix = out_path.suffix or ".csv"
-    header = "cidx,sv_t2e,sv_ev_ind,upd_cnt,last_int\n"
+    header = "cidx,sv_t2e_s,sv_ev_ind,upd_cnt_log1p,last_int_ms_log1p\n"
     window_idx = 0
 
-    snapshot_buffer = [None] * max_chunks  # Snapshot buffer
     try:
         while True:
             window_idx += 1
-            window_start = time.monotonic()
+            window_start_ms = time.monotonic_ns() // 1_000_000
+            window_end_ms = window_start_ms + interval_ms
+            window_cfg[wkey] = WindowTimes(window_start_ms, window_end_ms)
             time.sleep(DEFAULT_INTERVAL)
-            window_end = time.monotonic()
 
-            # 1) Copy chunk_array to snapshot buffer
-            for chunk_id in range(max_chunks):
-                v = chunk_array[chunk_id]
-                snapshot_buffer[chunk_id] = (
-                    v.sv_time2event_ts,
-                    v.last_update_ts,
-                    v.update_count,
-                    v.sv_event_indicator,
-                )
-
-            # 2) Initialize chunk_array immediately (next window starts here)
-            for chunk_id in range(max_chunks):
-                v = chunk_array[chunk_id]
-                v.update_count = 0
-                v.last_update_ts = 0
-                v.sv_time2event_ts = 0
-                v.sv_event_indicator = 0
-                v.last_accessed_lba = 0xFFFFFFFFFFFFFFFF  # unset for next window
-
-            # 3) Write snapshot buffer to file (monotonic time operations)
+            # 1) Write CSV: BPF already stores window-relative values.
             window_out = out_dir / f"{stem}_{window_idx}{suffix}"
             with open(window_out, "w") as f:
                 f.write(header)
                 for chunk_id in range(max_chunks):
-                    t2e_ts, luts, uc, ev = snapshot_buffer[chunk_id]
+                    v = chunk_array[chunk_id]
+                    uc = v.update_count
+                    ev = v.sv_event_indicator
                     if uc > 0:
-                        sv_t2e = max(0.0, t2e_ts - window_start) # time to event from window start
-                        last_int = max(0.0, window_end - luts) # latest update interval 
-                        f.write(f"{chunk_id},{sv_t2e:.3f},{ev},{uc},{last_int:.3f}\n")
+                        if ev:
+                            sv_t2e_s = min(int(v.sv_time2event_ms), interval_ms) / 1000.0
+                            if (sv_t2e_s >= interval_ms / 1000.0):
+                                print(f"1. sv_t2e_s >= interval_ms / 1000.0: {sv_t2e_s}")
+                                sv_t2e_s = interval_ms / 1000.0
+                        else:
+                            sv_t2e_s = interval_ms / 1000.0
 
-            print(f"[{window_end:.1f}] Wrote {window_out} and cleared map.")
+                        last_int_ms = int(v.last_update_interval_ms)
+                        if last_int_ms >= interval_ms:
+                            print(f"2. last_int_ms >= interval_ms: {last_int_ms}")
+                            last_int_ms = interval_ms
+                        
+                        uc_log1p = math.log1p(float(uc))
+                        last_int_ms_log1p = math.log1p(float(last_int_ms))
+                        
+                        f.write(
+                            f"{chunk_id},{sv_t2e_s:.3f},{ev},{uc_log1p:.4f},{last_int_ms_log1p:.4f}\n"
+                        )
+
+            # 2) Clear chunk_array after writing (next window starts here)
+            for chunk_id in range(max_chunks):
+                v = chunk_array[chunk_id]
+                v.update_count = 0
+                v.last_update_interval_ms = 0
+                v.last_update_ts_ms = 0
+                v.sv_time2event_ms = 0
+                v.sv_event_indicator = 0
+                v.last_accessed_lba = 0xFFFFFFFFFFFFFFFF  # unset for next window
+                chunk_array[chunk_id] = v
+
+            print(f"[window_end_ms={window_end_ms}] Wrote {window_out} and cleared map.")
 
     except KeyboardInterrupt:
         print("\nTracing stopped.")

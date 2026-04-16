@@ -9,17 +9,27 @@
 #define __LBA_SHIFT__ 0        // injected: 9 (512B) or 12 (4K)
 #define __LBAS_PER_CHUNK__ 0   // injected: CHUNK_SIZE / logical_block_size
 #define UPDATE_COUNT_MAX 65535 // 65535 (u16 max)
+/* Injected: after increment, set sv_t2e / event when update_count == this (>=1). */
+#define __SV_EVENT_AT_UPDATE__ 1
 #define SECTOR_SHIFT 9
 
-struct chunk_info {
-    // survival analysis labels: time to event and event indicator
-    u32 sv_time2event_ts;
-    u8 sv_event_indicator : 1;  // Boolean value
-    // survival analysis feature vectors: update count, last update
-    u16 update_count;
-    u32 last_update_ts;
+/* CLOCK_MONOTONIC ms (bpf_ktime_get_ns() / 1e6). */
+struct window_times {
+	u64 window_start_ms;
+	u64 window_end_ms;
+};
 
-    u64 last_accessed_lba;
+struct chunk_info {
+	/* survival anlysis labels: time to event and event indicator */
+	u16 sv_time2event_ms;
+	u8 sv_event_indicator : 1;
+
+	/* survival anlysis feature vectors */
+    u16 update_count;
+	u16 last_update_interval_ms;
+	u64 last_update_ts_ms;
+
+	u64 last_accessed_lba;
 };
 
 #define __MAX_CHUNKS__ 0 // Maximum number of chunks (injected from user space at runtime)
@@ -43,10 +53,23 @@ static long (*bpf_probe_write_kernel_bio_write_stream)(struct bio *bio, u8 strea
 // Chunk array for O(1) access
 BPF_ARRAY(chunk_array, struct chunk_info, 1);
 
+/* Key 0: current window [start_ms, end_ms); userspace updates each interval. */
+BPF_ARRAY(window_cfg, struct window_times, 1);
+
 /* kprobe: LBA shift / LBAs per 1MB chunk injected from user space (blockdev --getss). */
 int kprobe__nvme_setup_cmd(struct pt_regs *ctx) {
-    void *req = (void *)PT_REGS_PARM2(ctx);
-    if (!req) return 0;
+	u64 now_ms = bpf_ktime_get_ns() / 1000000ULL;
+	u32 wcfg_key = 0;
+	struct window_times *win = window_cfg.lookup(&wcfg_key);
+	if (win && (win->window_start_ms || win->window_end_ms)) {
+		if (now_ms <= win->window_start_ms)
+			return 0;
+		if (now_ms >= win->window_end_ms)
+			return 0;
+	}
+
+	void *req = (void *)PT_REGS_PARM2(ctx);
+	if (!req) return 0;
 
     /* Only the namespace block device we track (matches user space ns_path via st_rdev). */
     u64 bio_ptr = 0;
@@ -95,10 +118,18 @@ int kprobe__nvme_setup_cmd(struct pt_regs *ctx) {
             } else {
                 if (info->update_count < UPDATE_COUNT_MAX)
                     info->update_count += 1;
-                u64 now_sec = bpf_ktime_get_ns() / 1000000000ULL;
-                info->last_update_ts = (u32)now_sec;
-                info->sv_time2event_ts = (u32)now_sec;
-                info->sv_event_indicator = 1;
+                
+                if (info->last_update_ts_ms == 0) {
+                    info->last_update_ts_ms = now_ms;
+                    info->last_update_interval_ms = 0;
+                } else {
+                    info->last_update_interval_ms = (u16)(now_ms - info->last_update_ts_ms);
+                    info->last_update_ts_ms = now_ms;
+                }
+                if (info->update_count == __SV_EVENT_AT_UPDATE__) {
+                    info->sv_time2event_ms = (u16)(now_ms - win->window_start_ms);
+                    info->sv_event_indicator = 1;
+                }
                 info->last_accessed_lba = end_lba;
             }
         }

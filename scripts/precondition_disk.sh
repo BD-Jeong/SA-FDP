@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -------- Global config --------
-PREFILL_PERCENT=90
+PREFILL_PERCENT=50
 MOUNT_POINT="/mnt/sa_fdp"
 FS_TYPE="ext4"
 # nvme format (erase) settings
@@ -173,7 +173,7 @@ mkfs.ext4 -F "$device" >/dev/null
 
 echo "[+] Mounting to $MOUNT_POINT"
 mkdir -p "$MOUNT_POINT"
-mount -t "$FS_TYPE" "$device" "$MOUNT_POINT"
+mount -t "$FS_TYPE" -o nodiscard "$device" "$MOUNT_POINT"
 
 device_bytes="$(blockdev --getsize64 "$device")"
 fs_bytes=$(df -B1 --output=size "$MOUNT_POINT" | tail -1)
