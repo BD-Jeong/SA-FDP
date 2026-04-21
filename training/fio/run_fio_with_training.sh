@@ -10,7 +10,7 @@ TRAINING_OUT="/home/bd/SA-FDP/training/fio/out/training.csv"
 FIO_SCRIPT="/home/bd/SA-FDP/training/fio/fio_matrix_runner.py"
 FIO_TARGET="/dev/nvme0n1"
 # Repeat/add values to run more total-size combinations.
-FIO_TOTAL_SIZES=("2T" "4T" "8T")
+FIO_TOTAL_SIZES=("1T" "8T")
 FIO_WORKERS="16"
 FIO_OUTPUT_DIR="/home/bd/SA-FDP/training/fio/out/fio-matrix"
 

@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 
 # Global test matrix/constants
-IODEPTHS = [1, 4, 16]
-SKEWS = [0.0, 0.8, 1.2]
+IODEPTHS = [1, 8, 16]
+SKEWS = [0.0, 0.6, 1.2]
 BS = "4k"
 RUNTIME_SEC = 300
 

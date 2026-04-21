@@ -217,14 +217,15 @@ def main():
                         else:
                             sv_t2e_s = interval_ms / 1000.0
 
-                        last_int_ms = int(v.last_update_interval_ms)
+                        last_int_ms = float(v.last_update_interval_ms)
                         if last_int_ms >= interval_ms:
                             print(f"2. last_int_ms >= interval_ms: {last_int_ms}")
                             last_int_ms = interval_ms
-                        
+
                         uc_log1p = math.log1p(float(uc))
                         last_int_ms_log1p = math.log1p(float(last_int_ms))
-                        
+
+                        #f.write(f"{chunk_id},{sv_t2e_s:.3f},{ev},{uc},{last_int_ms:.4f}\n")
                         f.write(
                             f"{chunk_id},{sv_t2e_s:.3f},{ev},{uc_log1p:.4f},{last_int_ms_log1p:.4f}\n"
                         )

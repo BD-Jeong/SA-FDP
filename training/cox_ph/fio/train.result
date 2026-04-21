@@ -1,0 +1,16 @@
+Train files: 55 (1..55)
+Loading train CSVs (chunksize=500000, sample_frac=0.2, seed=0) ...
+Train rows (raw): 33,324,367
+Dropped rows with NA: 0
+Train rows (processed): 33,324,367
+Train event rate: 0.2286
+Train unique chunks: 8,027,846
+Train C-index: 0.9822
+
+=== Cox summary ===
+                       coef  exp(coef)  se(coef)    p
+covariate                                            
+upd_cnt_log1p      1.596049   4.933500  0.000351  0.0
+last_int_ms_log1p -0.104821   0.900486  0.000415  0.0
+
+Saved model artifact: /home/bd/SA-FDP/training/cox_ph/cox_model_fio_1_55.pkl

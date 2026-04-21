@@ -3,10 +3,10 @@
 Train Cox PH model and save artifacts (model + scaler + metadata).
 python3 train_cox_model.py \
   --data-dir ../fio/out/ \
-  --train-range 1 30 \
-  --model-out cox_model_fio_1_30.pkl \
+  --train-range 1 55 \
+  --model-out cox_model_fio_1_55.pkl \
   --penalizer 0.1 \
-  --sample-frac 0.8
+  --sample-frac 0.5
 """
 import argparse
 import gc

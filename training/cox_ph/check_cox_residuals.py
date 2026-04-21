@@ -4,18 +4,18 @@ Check Cox PH residual diagnostics using a trained artifact and dataset.
 
 Example:
   python3 check_cox_residuals.py \
-    --model cox_model_fio_1_30.pkl \
+    --model cox_model_fio_1_55.pkl \
     --data-dir ../fio/out \
-    --train-range 1 30 \
+    --train-range 1 55 \
     --sample-frac 0.01 \
     --out-prefix cox_residuals_fio \
     --cache-out cox_residuals_fio_residual_cache.pkl \
-    --max-plot-points 100000
+    --max-plot-points 300
 
   python3 check_cox_residuals.py \
     --cache-in cox_residuals_fio_residual_cache.pkl \
     --out-prefix cox_residuals_fio \
-    --max-plot-points 100000
+    --max-plot-points 300
 """
 import argparse
 import os
@@ -149,7 +149,16 @@ def draw_schoenfeld_plot(feature_cols, scho, event_times, ph_summary, pdf_out, m
         y_sorted = y[order]
         smooth = lowess(y_sorted, x_sorted, frac=0.3, return_sorted=True)
 
-        ax.scatter(x, y, s=14, color="gray", alpha=0.65, linewidths=0)
+        ax.scatter(
+            x,
+            y,
+            s=10,
+            facecolors="black",
+            edgecolors="black",
+            linewidths=1,
+            alpha=0.8,
+            zorder=3,
+        )
 
         yhat_interp = np.interp(x_sorted, smooth[:, 0], smooth[:, 1])
         resid_std = float(np.std(y_sorted - yhat_interp))
@@ -157,14 +166,17 @@ def draw_schoenfeld_plot(feature_cols, scho, event_times, ph_summary, pdf_out, m
             smooth[:, 0],
             smooth[:, 1] - resid_std,
             smooth[:, 1] + resid_std,
-            color="gray",
-            alpha=0.22,
+            facecolor="#C8E6C9",
+            edgecolor="#66BB6A",
+            linewidth=1.2,
+            alpha=0.5,
+            zorder=1,
             label="~1 sigma band",
         )
 
-        ax.plot(smooth[:, 0], smooth[:, 1], color="#2A6FDF", linewidth=2.2, label="LOWESS")
+        ax.plot(smooth[:, 0], smooth[:, 1], color="red", linewidth=2.0, zorder=4, label="LOWESS")
         ax.axhline(0.0, linestyle="--", color="black", linewidth=1)
-        ax.set_ylim(-5, 5)
+        ax.set_ylim(-3, 3)
 
         pval = np.nan
         if ph_summary is not None and cov in ph_summary.index and "p" in ph_summary.columns:
